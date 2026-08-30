@@ -627,9 +627,23 @@ def handle_connection(conn, topics, partitions, log_dir):
     with conn:
         # Handle multiple sequential requests on the same connection.
         while True:
-            data = conn.recv(1024)
-            if not data:
-                break  # client closed the connection
+            # Read the full message based on its message_size field (first 4
+            # bytes). A request may be larger than the recv buffer, so loop
+            # until the entire message has been read.
+            size_bytes = b""
+            while len(size_bytes) < 4:
+                chunk = conn.recv(4 - len(size_bytes))
+                if not chunk:
+                    return  # client closed the connection
+                size_bytes += chunk
+            message_size = struct.unpack(">i", size_bytes)[0]
+            body = b""
+            while len(body) < message_size:
+                chunk = conn.recv(message_size - len(body))
+                if not chunk:
+                    return  # client closed the connection
+                body += chunk
+            data = size_bytes + body
             response = handle_request(data, topics, partitions, log_dir)
             conn.sendall(response)
 
