@@ -17,6 +17,33 @@ def read_varint(data, offset):
     return value, offset
 
 
+def write_varint(value):
+    """Encode an unsigned varint. Returns bytes."""
+    out = b""
+    while True:
+        b = value & 0x7F
+        value >>= 7
+        if value:
+            out += bytes([b | 0x80])
+        else:
+            out += bytes([b])
+            break
+    return out
+
+
+def read_topic_log_records(topic_name):
+    """Read the record batch(es) from a topic's log file on disk.
+
+    Returns the raw record batch bytes, or None if the file doesn't exist.
+    """
+    log_path = f"/tmp/kraft-combined-logs/{topic_name}-0/00000000000000000000.log"
+    try:
+        with open(log_path, "rb") as f:
+            return f.read()
+    except OSError:
+        return None
+
+
 def read_zigzag_varint(data, offset):
     """Read a zigzag-encoded varint. Returns (value, new_offset)."""
     v, offset = read_varint(data, offset)
@@ -405,14 +432,24 @@ def build_fetch_response(data, correlation_id, body_offset, topics, partitions):
     # Response header v1: correlation_id (INT32) + TAG_BUFFER (empty)
     header = struct.pack(">i", correlation_id) + bytes([0])
 
+    # Build a reverse mapping from topic_id -> topic_name so we can locate the
+    # topic's log file on disk.
+    topic_id_to_name = {v: k for k, v in topics.items()}
+
     # Build each topic entry. For an unknown topic, return error_code 100.
-    # For a known topic with no messages, return error_code 0 and an empty
-    # records batch.
+    # For a known topic, read the record batch(es) from its log file on disk
+    # and return them in the records field.
     topic_entries = b""
     for topic_id in topic_ids:
         if topic_id in partitions:
             error_code = 0  # No Error
-            records = bytes([1])  # empty records batch (0 bytes of data)
+            topic_name = topic_id_to_name.get(topic_id)
+            batch = read_topic_log_records(topic_name) if topic_name else None
+            if batch:
+                # COMPACT_RECORDS: varint(len + 1) + record batch bytes
+                records = write_varint(len(batch) + 1) + batch
+            else:
+                records = bytes([1])  # empty records batch (0 bytes of data)
         else:
             error_code = 100  # UNKNOWN_TOPIC_ID
             records = bytes([0])  # null records
