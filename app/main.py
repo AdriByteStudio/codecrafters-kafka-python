@@ -7,9 +7,9 @@ def main():
     print("Logs from your program will appear here!")
 
     # TODO: Uncomment the code below to pass the first stage
-    #
-    # server = socket.create_server(("localhost", 9092), reuse_port=True)
-    # server.accept() # wait for client
+    
+    server = socket.create_server(("localhost", 9092), reuse_port=True)
+    server.accept() # wait for client
 
 
 if __name__ == "__main__":
