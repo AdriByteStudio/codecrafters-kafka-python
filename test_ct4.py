@@ -71,8 +71,8 @@ body += bytes([2]) + write_compact_string('banana')
 body += bytes([4])  # 3 partitions
 for i in range(3):
     batch = make_batch([make_record(b'hello world partition %d' % i)])
-    # TEST: use varint(len) encoding (NOT len+1)
-    body += struct.pack('>i', i) + write_varint(len(batch)) + batch
+    # TEST: use varint(len+1) encoding (per binspec)
+    body += struct.pack('>i', i) + write_varint(len(batch) + 1) + batch
 body += bytes([0]) + bytes([0])
 req = struct.pack('>i', len(header)+len(body)) + header + body
 

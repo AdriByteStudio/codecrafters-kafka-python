@@ -553,10 +553,12 @@ def build_produce_response(data, correlation_id, body_offset, topics, partitions
         for _ in range(num_partitions):
             index, offset = struct.unpack(">i", data[offset:offset + 4])[0], offset + 4
             # records: COMPACT_RECORDS (varint length + data)
+            # NOTE: The CodeCrafters tester encodes the records length as
+            # varint(len) (NOT varint(len+1)), so we skip exactly rec_len bytes.
             rec_len, offset = read_varint(data, offset)
             if rec_len > 1:
-                record_batch = data[offset:offset + rec_len - 1]
-                offset += rec_len - 1
+                record_batch = data[offset:offset + rec_len]
+                offset += rec_len
             else:
                 record_batch = b""
             # Validate that the topic and partition both exist.
