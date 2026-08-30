@@ -1,5 +1,6 @@
 import socket
 import struct
+import threading
 
 
 def handle_request(data):
@@ -50,9 +51,7 @@ def handle_request(data):
     return struct.pack(">i", message_size) + header + body
 
 
-def main():
-    server = socket.create_server(("localhost", 9092), reuse_port=True)
-    conn, addr = server.accept()
+def handle_connection(conn):
     with conn:
         # Handle multiple sequential requests on the same connection.
         while True:
@@ -61,6 +60,15 @@ def main():
                 break  # client closed the connection
             response = handle_request(data)
             conn.sendall(response)
+
+
+def main():
+    server = socket.create_server(("localhost", 9092), reuse_port=True)
+    while True:
+        conn, addr = server.accept()
+        # Handle each client connection in its own thread to support concurrency.
+        thread = threading.Thread(target=handle_connection, args=(conn,))
+        thread.start()
 
 
 if __name__ == "__main__":
