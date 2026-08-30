@@ -27,13 +27,19 @@ def handle_request(data):
     else:
         error_code = 35
 
-    # Build the api_keys array with one entry for API key 18 (ApiVersions), versions 0-4.
-    # COMPACT_ARRAY length is encoded as n + 1 (unsigned varint). With 1 element, that's 2.
+    # Build the api_keys array with entries for:
+    #   - API key 18 (ApiVersions), versions 0-4
+    #   - API key 75 (DescribeTopicPartitions), versions 0-0
+    # COMPACT_ARRAY length is encoded as n + 1 (unsigned varint). With 2 elements, that's 3.
     api_keys = (
-        bytes([2])  # array length: 1 element -> 2
+        bytes([3])  # array length: 2 elements -> 3
         + struct.pack(">h", 18)  # api_key: 18 (ApiVersions)
         + struct.pack(">h", 0)  # min_version: 0
         + struct.pack(">h", 4)  # max_version: 4
+        + bytes([0])  # TAG_BUFFER: empty
+        + struct.pack(">h", 75)  # api_key: 75 (DescribeTopicPartitions)
+        + struct.pack(">h", 0)  # min_version: 0
+        + struct.pack(">h", 0)  # max_version: 0
         + bytes([0])  # TAG_BUFFER: empty
     )
 
