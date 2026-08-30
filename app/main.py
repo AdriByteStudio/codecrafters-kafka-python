@@ -17,6 +17,35 @@ def read_varint(data, offset):
     return value, offset
 
 
+def read_zigzag_varint(data, offset):
+    """Read a zigzag-encoded varint. Returns (value, new_offset)."""
+    v, offset = read_varint(data, offset)
+    return ((v >> 1) ^ -(v & 1)), offset
+
+
+def read_compact_string(data, offset):
+    """Read a COMPACT_STRING. Returns (string_or_None, new_offset)."""
+    n, offset = read_varint(data, offset)
+    if n == 0:
+        return None, offset  # null
+    length = n - 1
+    s = data[offset:offset + length].decode("utf-8")
+    return s, offset + length
+
+
+def read_compact_array_count(data, offset):
+    """Read a COMPACT_ARRAY length prefix. Returns (count_or_None, new_offset)."""
+    n, offset = read_varint(data, offset)
+    if n == 0:
+        return None, offset  # null
+    return n - 1, offset
+
+
+def read_uuid(data, offset):
+    """Read a UUID (16 bytes). Returns (bytes, new_offset)."""
+    return data[offset:offset + 16], offset + 16
+
+
 def skip_tag_buffer(data, offset):
     """Skip a TAGGED_FIELDS structure. Returns new_offset."""
     num_fields, offset = read_varint(data, offset)
@@ -25,6 +54,149 @@ def skip_tag_buffer(data, offset):
         size, offset = read_varint(data, offset)  # size
         offset += size
     return offset
+
+
+def parse_topic_record(data, offset):
+    """Parse a TopicRecord value. Returns (dict, new_offset)."""
+    name, offset = read_compact_string(data, offset)
+    topic_id, offset = read_uuid(data, offset)
+    offset = skip_tag_buffer(data, offset)
+    return {"name": name, "topic_id": topic_id}, offset
+
+
+def parse_partition_record(data, offset, version):
+    """Parse a PartitionRecord value. Returns (dict, new_offset)."""
+    partition_id = struct.unpack(">i", data[offset:offset + 4])[0]
+    offset += 4
+    topic_id, offset = read_uuid(data, offset)
+
+    def read_int32_array(offset):
+        count, offset = read_compact_array_count(data, offset)
+        arr = []
+        for _ in range(count):
+            arr.append(struct.unpack(">i", data[offset:offset + 4])[0])
+            offset += 4
+        return arr, offset
+
+    replicas, offset = read_int32_array(offset)
+    isr, offset = read_int32_array(offset)
+    removing, offset = read_int32_array(offset)
+    adding, offset = read_int32_array(offset)
+    leader = struct.unpack(">i", data[offset:offset + 4])[0]
+    offset += 4
+    leader_epoch = struct.unpack(">i", data[offset:offset + 4])[0]
+    offset += 4
+    partition_epoch = struct.unpack(">i", data[offset:offset + 4])[0]
+    offset += 4
+
+    directories = []
+    if version >= 1:
+        count, offset = read_compact_array_count(data, offset)
+        for _ in range(count):
+            d, offset = read_uuid(data, offset)
+            directories.append(d)
+
+    # TAG_BUFFER: read tagged fields (tag 0 = LeaderRecoveryState)
+    num_tags, offset = read_varint(data, offset)
+    leader_recovery_state = 0
+    for _ in range(num_tags):
+        tag, offset = read_varint(data, offset)
+        size, offset = read_varint(data, offset)
+        if tag == 0:
+            leader_recovery_state = data[offset]
+        offset += size
+
+    return {
+        "partition_id": partition_id,
+        "topic_id": topic_id,
+        "replicas": replicas,
+        "isr": isr,
+        "leader": leader,
+        "leader_epoch": leader_epoch,
+        "partition_epoch": partition_epoch,
+        "directories": directories,
+        "leader_recovery_state": leader_recovery_state,
+    }, offset
+
+
+def parse_metadata_value(value):
+    """Parse the value bytes of a metadata record. Returns (dict, new_offset)."""
+    offset = 0
+    frame_version, offset = read_varint(value, offset)  # expect 1
+    rec_type, offset = read_varint(value, offset)  # 2 = TOPIC_RECORD, 3 = PARTITION_RECORD
+    version, offset = read_varint(value, offset)
+    if rec_type == 2:
+        return parse_topic_record(value, offset)
+    elif rec_type == 3:
+        return parse_partition_record(value, offset, version)
+    else:
+        return None, offset
+
+
+def load_cluster_metadata(log_path):
+    """Parse the cluster metadata log file.
+
+    Returns (topics_by_name, partitions_by_topic_id).
+    topics_by_name: { name: topic_id_bytes }
+    partitions_by_topic_id: { topic_id_bytes: [partition_dict, ...] }
+    """
+    topics = {}
+    partitions = {}
+    try:
+        with open(log_path, "rb") as f:
+            data = f.read()
+    except OSError:
+        return topics, partitions
+
+    offset = 0
+    while offset < len(data):
+        base_offset = struct.unpack(">q", data[offset:offset + 8])[0]
+        offset += 8
+        batch_length = struct.unpack(">i", data[offset:offset + 4])[0]
+        offset += 4
+        batch_end = offset + batch_length
+        offset += 4  # partitionLeaderEpoch
+        magic = data[offset]
+        offset += 1
+        offset += 4  # crc
+        offset += 2  # attributes
+        offset += 4  # lastOffsetDelta
+        offset += 8  # baseTimestamp
+        offset += 8  # maxTimestamp
+        offset += 8  # producerId
+        offset += 2  # producerEpoch
+        offset += 4  # baseSequence
+        records_count = struct.unpack(">i", data[offset:offset + 4])[0]
+        offset += 4
+
+        for _ in range(records_count):
+            rec_len, offset = read_varint(data, offset)
+            rec_end = offset + rec_len
+            offset += 1  # attributes
+            _, offset = read_zigzag_varint(data, offset)  # timestampDelta
+            _, offset = read_zigzag_varint(data, offset)  # offsetDelta
+            key_len, offset = read_zigzag_varint(data, offset)
+            if key_len >= 0:
+                offset += key_len
+            val_len, offset = read_zigzag_varint(data, offset)
+            if val_len >= 0:
+                value = data[offset:offset + val_len]
+                offset += val_len
+                parsed, _ = parse_metadata_value(value)
+                if parsed is not None and "name" in parsed:
+                    topics[parsed["name"]] = parsed["topic_id"]
+                elif parsed is not None and "partition_id" in parsed:
+                    partitions.setdefault(parsed["topic_id"], []).append(parsed)
+            # skip headers
+            hcount, offset = read_varint(data, offset)
+            for _ in range(hcount):
+                hk_len, offset = read_varint(data, offset)
+                offset += hk_len
+                hv_len, offset = read_varint(data, offset)
+                offset += hv_len
+            offset = rec_end
+        offset = batch_end
+    return topics, partitions
 
 
 def parse_request_header(data):
@@ -94,7 +266,30 @@ def build_api_versions_response(correlation_id, request_api_version):
     return struct.pack(">i", message_size) + header + body
 
 
-def build_describe_topic_partitions_response(data, correlation_id, body_offset):
+def build_partition_entry(partition):
+    """Build a single partition entry for the DescribeTopicPartitions response."""
+    replicas = partition["replicas"]
+    isr = partition["isr"]
+
+    def compact_array(elements):
+        # COMPACT_ARRAY: varint(len + 1), then elements
+        return bytes([len(elements) + 1]) + b"".join(struct.pack(">i", e) for e in elements)
+
+    return (
+        struct.pack(">h", 0)  # error_code: 0 (no error)
+        + struct.pack(">i", partition["partition_id"])  # partition_index
+        + struct.pack(">i", partition["leader"])  # leader_id
+        + struct.pack(">i", partition["leader_epoch"])  # leader_epoch
+        + compact_array(replicas)  # replica_nodes
+        + compact_array(isr)  # isr_nodes
+        + bytes([1])  # eligible_leader_replicas: 0 elements (empty)
+        + bytes([1])  # last_known_elr: 0 elements (empty)
+        + bytes([1])  # offline_replicas: 0 elements (empty)
+        + bytes([0])  # TAG_BUFFER: empty
+    )
+
+
+def build_describe_topic_partitions_response(data, correlation_id, body_offset, topics, partitions):
     # Parse the request body to extract the topic name.
     # DescribeTopicPartitions request (v0) body:
     #   topics: COMPACT_ARRAY of { topic_name: COMPACT_STRING, TAG_BUFFER }
@@ -107,29 +302,30 @@ def build_describe_topic_partitions_response(data, correlation_id, body_offset):
     name_len -= 1
     topic_name = data[offset:offset + name_len]
 
-    # Build the DescribeTopicPartitions response (v0) for an unknown topic.
     # Response header v1: correlation_id (INT32) + TAG_BUFFER (empty)
     header = struct.pack(">i", correlation_id) + bytes([0])
 
-    # Response body:
-    #   throttle_time_ms:        INT32 (0)
-    #   topics:                  COMPACT_ARRAY
-    #     error_code:            INT16 (3 = UNKNOWN_TOPIC_OR_PARTITION)
-    #     topic_name:            COMPACT_STRING
-    #     topic_id:              UUID (16 bytes, all zeros)
-    #     is_internal:           BOOLEAN (false)
-    #     partitions:            COMPACT_ARRAY (empty)
-    #     topic_authorized_operations: INT32 (0)
-    #     TAG_BUFFER:            empty
-    #   next_cursor:             NULLABLE_INT8 (-1 = null)
-    #   TAG_BUFFER:              empty
+    # Look up the topic in the cluster metadata.
+    topic_id = topics.get(topic_name.decode("utf-8"))
+    if topic_id is not None:
+        error_code = 0
+        topic_partitions = partitions.get(topic_id, [])
+        topic_partitions.sort(key=lambda p: p["partition_id"])
+        partition_entries = b"".join(build_partition_entry(p) for p in topic_partitions)
+        partitions_array = bytes([len(topic_partitions) + 1]) + partition_entries
+    else:
+        error_code = 3  # UNKNOWN_TOPIC_OR_PARTITION
+        topic_id = bytes(16)  # all zeros
+        partitions_array = bytes([1])  # 0 elements (empty)
+
+    # Build the topic entry.
     topic = (
-        struct.pack(">h", 3)  # error_code: 3 (UNKNOWN_TOPIC_OR_PARTITION)
+        struct.pack(">h", error_code)  # error_code
         + bytes([len(topic_name) + 1])  # topic_name length (compact string: n + 1)
         + topic_name  # topic_name
-        + bytes(16)  # topic_id: all zeros
+        + topic_id  # topic_id
         + bytes([0])  # is_internal: false
-        + bytes([1])  # partitions array: 0 elements -> 1
+        + partitions_array  # partitions
         + struct.pack(">i", 0)  # topic_authorized_operations: 0
         + bytes([0])  # TAG_BUFFER: empty
     )
@@ -146,32 +342,36 @@ def build_describe_topic_partitions_response(data, correlation_id, body_offset):
     return struct.pack(">i", message_size) + header + body
 
 
-def handle_request(data):
+def handle_request(data, topics, partitions):
     api_key, api_version, correlation_id, body_offset = parse_request_header(data)
 
     if api_key == 75:  # DescribeTopicPartitions
-        return build_describe_topic_partitions_response(data, correlation_id, body_offset)
+        return build_describe_topic_partitions_response(data, correlation_id, body_offset, topics, partitions)
     else:  # ApiVersions (18)
         return build_api_versions_response(correlation_id, api_version)
 
 
-def handle_connection(conn):
+def handle_connection(conn, topics, partitions):
     with conn:
         # Handle multiple sequential requests on the same connection.
         while True:
             data = conn.recv(1024)
             if not data:
                 break  # client closed the connection
-            response = handle_request(data)
+            response = handle_request(data, topics, partitions)
             conn.sendall(response)
 
 
 def main():
+    # Load cluster metadata from the log file.
+    log_path = "/tmp/kraft-combined-logs/__cluster_metadata-0/00000000000000000000.log"
+    topics, partitions = load_cluster_metadata(log_path)
+
     server = socket.create_server(("localhost", 9092), reuse_port=True)
     while True:
         conn, addr = server.accept()
         # Handle each client connection in its own thread to support concurrency.
-        thread = threading.Thread(target=handle_connection, args=(conn,))
+        thread = threading.Thread(target=handle_connection, args=(conn, topics, partitions))
         thread.start()
 
 
