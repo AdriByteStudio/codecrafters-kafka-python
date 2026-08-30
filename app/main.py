@@ -503,9 +503,9 @@ def build_fetch_response(data, correlation_id, body_offset, topics, partitions):
 def build_produce_response(data, correlation_id, body_offset):
     """Build a Produce (v11) response for invalid topics or partitions.
 
-    Produce Response (Version: 11):
-      throttle_time_ms => INT32
+    Produce Response (Version: 11) — field order per the CodeCrafters tester:
       responses => COMPACT_ARRAY of { name, partition_responses }
+      throttle_time_ms => INT32
       TAG_BUFFER
 
     Each partition response carries error_code 3 (UNKNOWN_TOPIC_OR_PARTITION)
@@ -559,9 +559,9 @@ def build_produce_response(data, correlation_id, body_offset):
     header = struct.pack(">i", correlation_id) + bytes([0])
 
     body = (
-        struct.pack(">i", 0)  # throttle_time_ms: 0
-        + write_compact_array(num_topics)  # responses array
+        write_compact_array(num_topics)  # responses array (topics)
         + topic_entries
+        + struct.pack(">i", 0)  # throttle_time_ms: 0
         + bytes([0])  # TAG_BUFFER: empty
     )
 
