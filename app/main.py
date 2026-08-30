@@ -644,7 +644,12 @@ def handle_connection(conn, topics, partitions, log_dir):
                     return  # client closed the connection
                 body += chunk
             data = size_bytes + body
-            response = handle_request(data, topics, partitions, log_dir)
+            try:
+                response = handle_request(data, topics, partitions, log_dir)
+            except Exception:
+                import traceback
+                traceback.print_exc()
+                raise
             conn.sendall(response)
 
 
