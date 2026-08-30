@@ -1,5 +1,7 @@
+import os
 import socket
 import struct
+import sys
 import threading
 
 
@@ -42,12 +44,27 @@ def write_compact_array(count):
     return write_varint(count + 1)
 
 
-def read_topic_log_records(topic_name):
+def get_log_dir(properties_path):
+    """Parse server.properties to find the log directory (log.dirs)."""
+    log_dir = "/tmp/kraft-combined-logs"
+    try:
+        with open(properties_path) as f:
+            for line in f:
+                line = line.strip()
+                if line.startswith("log.dirs="):
+                    log_dir = line.split("=", 1)[1].strip()
+                    break
+    except OSError:
+        pass
+    return log_dir
+
+
+def read_topic_log_records(topic_name, log_dir):
     """Read the record batch(es) from a topic's log file on disk.
 
     Returns the raw record batch bytes, or None if the file doesn't exist.
     """
-    log_path = f"/tmp/kraft-combined-logs/{topic_name}-0/00000000000000000000.log"
+    log_path = f"{log_dir}/{topic_name}-0/00000000000000000000.log"
     try:
         with open(log_path, "rb") as f:
             return f.read()
@@ -402,7 +419,7 @@ def build_describe_topic_partitions_response(data, correlation_id, body_offset, 
     return struct.pack(">i", message_size) + header + body
 
 
-def build_fetch_response(data, correlation_id, body_offset, topics, partitions):
+def build_fetch_response(data, correlation_id, body_offset, topics, partitions, log_dir):
     """Build a Fetch (v16) response.
 
     Fetch Response (Version: 16):
@@ -460,7 +477,7 @@ def build_fetch_response(data, correlation_id, body_offset, topics, partitions):
         if topic_id in partitions:
             error_code = 0  # No Error
             topic_name = topic_id_to_name.get(topic_id)
-            batch = read_topic_log_records(topic_name) if topic_name else None
+            batch = read_topic_log_records(topic_name, log_dir) if topic_name else None
             if batch:
                 # COMPACT_RECORDS: varint(len + 1) + record batch bytes
                 records = write_varint(len(batch) + 1) + batch
@@ -500,7 +517,7 @@ def build_fetch_response(data, correlation_id, body_offset, topics, partitions):
     return struct.pack(">i", message_size) + header + body
 
 
-def build_produce_response(data, correlation_id, body_offset, topics, partitions):
+def build_produce_response(data, correlation_id, body_offset, topics, partitions, log_dir):
     """Build a Produce (v11) response.
 
     Produce Response (Version: 11) — field order per the CodeCrafters tester:
@@ -537,8 +554,11 @@ def build_produce_response(data, correlation_id, body_offset, topics, partitions
             index, offset = struct.unpack(">i", data[offset:offset + 4])[0], offset + 4
             # records: COMPACT_RECORDS (varint length + data)
             rec_len, offset = read_varint(data, offset)
-            if rec_len > 0:
+            if rec_len > 1:
+                record_batch = data[offset:offset + rec_len - 1]
                 offset += rec_len - 1
+            else:
+                record_batch = b""
             # Validate that the topic and partition both exist.
             valid = (
                 topic_id is not None
@@ -548,6 +568,11 @@ def build_produce_response(data, correlation_id, body_offset, topics, partitions
                 error_code = 0
                 base_offset = 0
                 log_start_offset = 0
+                # Persist the record batch to the topic's log file on disk.
+                log_path = f"{log_dir}/{name}-{index}/00000000000000000000.log"
+                os.makedirs(os.path.dirname(log_path), exist_ok=True)
+                with open(log_path, "wb") as f:
+                    f.write(record_batch)
             else:
                 error_code = 3
                 base_offset = -1
@@ -585,40 +610,44 @@ def build_produce_response(data, correlation_id, body_offset, topics, partitions
     return struct.pack(">i", message_size) + header + body
 
 
-def handle_request(data, topics, partitions):
+def handle_request(data, topics, partitions, log_dir):
     api_key, api_version, correlation_id, body_offset = parse_request_header(data)
 
     if api_key == 75:  # DescribeTopicPartitions
         return build_describe_topic_partitions_response(data, correlation_id, body_offset, topics, partitions)
     elif api_key == 1:  # Fetch
-        return build_fetch_response(data, correlation_id, body_offset, topics, partitions)
+        return build_fetch_response(data, correlation_id, body_offset, topics, partitions, log_dir)
     elif api_key == 0:  # Produce
-        return build_produce_response(data, correlation_id, body_offset, topics, partitions)
+        return build_produce_response(data, correlation_id, body_offset, topics, partitions, log_dir)
     else:  # ApiVersions (18)
         return build_api_versions_response(correlation_id, api_version)
 
 
-def handle_connection(conn, topics, partitions):
+def handle_connection(conn, topics, partitions, log_dir):
     with conn:
         # Handle multiple sequential requests on the same connection.
         while True:
             data = conn.recv(1024)
             if not data:
                 break  # client closed the connection
-            response = handle_request(data, topics, partitions)
+            response = handle_request(data, topics, partitions, log_dir)
             conn.sendall(response)
 
 
 def main():
+    # Parse the log directory from server.properties (passed as argv[1]).
+    properties_path = sys.argv[1] if len(sys.argv) > 1 else "/tmp/server.properties"
+    log_dir = get_log_dir(properties_path)
+
     # Load cluster metadata from the log file.
-    log_path = "/tmp/kraft-combined-logs/__cluster_metadata-0/00000000000000000000.log"
+    log_path = f"{log_dir}/__cluster_metadata-0/00000000000000000000.log"
     topics, partitions = load_cluster_metadata(log_path)
 
     server = socket.create_server(("localhost", 9092), reuse_port=True)
     while True:
         conn, addr = server.accept()
         # Handle each client connection in its own thread to support concurrency.
-        thread = threading.Thread(target=handle_connection, args=(conn, topics, partitions))
+        thread = threading.Thread(target=handle_connection, args=(conn, topics, partitions, log_dir))
         thread.start()
 
 
