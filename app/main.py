@@ -290,22 +290,8 @@ def build_partition_entry(partition):
     )
 
 
-def build_describe_topic_partitions_response(data, correlation_id, body_offset, topics, partitions):
-    # Parse the request body to extract the topic name.
-    # DescribeTopicPartitions request (v0) body:
-    #   topics: COMPACT_ARRAY of { topic_name: COMPACT_STRING, TAG_BUFFER }
-    #   TAG_BUFFER
-    offset = body_offset
-    num_topics, offset = read_varint(data, offset)  # topics array length (n + 1)
-    num_topics -= 1
-    # Read the first topic name (COMPACT_STRING: length is n + 1)
-    name_len, offset = read_varint(data, offset)
-    name_len -= 1
-    topic_name = data[offset:offset + name_len]
-
-    # Response header v1: correlation_id (INT32) + TAG_BUFFER (empty)
-    header = struct.pack(">i", correlation_id) + bytes([0])
-
+def build_topic_entry(topic_name, topics, partitions):
+    """Build a single topic entry for the DescribeTopicPartitions response."""
     # Look up the topic in the cluster metadata.
     topic_id = topics.get(topic_name.decode("utf-8"))
     if topic_id is not None:
@@ -319,8 +305,7 @@ def build_describe_topic_partitions_response(data, correlation_id, body_offset, 
         topic_id = bytes(16)  # all zeros
         partitions_array = bytes([1])  # 0 elements (empty)
 
-    # Build the topic entry.
-    topic = (
+    return (
         struct.pack(">h", error_code)  # error_code
         + bytes([len(topic_name) + 1])  # topic_name length (compact string: n + 1)
         + topic_name  # topic_name
@@ -331,10 +316,36 @@ def build_describe_topic_partitions_response(data, correlation_id, body_offset, 
         + bytes([0])  # TAG_BUFFER: empty
     )
 
+
+def build_describe_topic_partitions_response(data, correlation_id, body_offset, topics, partitions):
+    # Parse the request body to extract all topic names.
+    # DescribeTopicPartitions request (v0) body:
+    #   topics: COMPACT_ARRAY of { topic_name: COMPACT_STRING, TAG_BUFFER }
+    #   TAG_BUFFER
+    offset = body_offset
+    num_topics, offset = read_varint(data, offset)  # topics array length (n + 1)
+    num_topics -= 1
+
+    topic_names = []
+    for _ in range(num_topics):
+        name_len, offset = read_varint(data, offset)  # COMPACT_STRING length (n + 1)
+        name_len -= 1
+        topic_name = data[offset:offset + name_len]
+        offset += name_len
+        offset = skip_tag_buffer(data, offset)  # topic's TAG_BUFFER
+        topic_names.append(topic_name)
+
+    # Response header v1: correlation_id (INT32) + TAG_BUFFER (empty)
+    header = struct.pack(">i", correlation_id) + bytes([0])
+
+    # Build a topic entry for each requested topic, sorted alphabetically by name.
+    topic_names.sort()
+    topic_entries = b"".join(build_topic_entry(name, topics, partitions) for name in topic_names)
+
     body = (
         struct.pack(">i", 0)  # throttle_time_ms: 0
-        + bytes([num_topics + 1])  # topics array length (n + 1)
-        + topic
+        + bytes([len(topic_names) + 1])  # topics array length (n + 1)
+        + topic_entries
         + bytes([0xFF])  # next_cursor: -1 (null)
         + bytes([0])  # TAG_BUFFER: empty
     )
