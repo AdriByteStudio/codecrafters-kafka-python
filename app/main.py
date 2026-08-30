@@ -421,6 +421,7 @@ def build_fetch_response(data, correlation_id, body_offset):
             topic_id  # topic_id: UUID
             + bytes([2])  # partitions array: 1 element (n + 1 = 2)
             + partition
+            + bytes([0])  # topic TAG_BUFFER: empty
         )
 
     body = (
