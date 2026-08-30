@@ -500,16 +500,18 @@ def build_fetch_response(data, correlation_id, body_offset, topics, partitions):
     return struct.pack(">i", message_size) + header + body
 
 
-def build_produce_response(data, correlation_id, body_offset):
-    """Build a Produce (v11) response for invalid topics or partitions.
+def build_produce_response(data, correlation_id, body_offset, topics, partitions):
+    """Build a Produce (v11) response.
 
     Produce Response (Version: 11) — field order per the CodeCrafters tester:
       responses => COMPACT_ARRAY of { name, partition_responses }
       throttle_time_ms => INT32
       TAG_BUFFER
 
-    Each partition response carries error_code 3 (UNKNOWN_TOPIC_OR_PARTITION)
-    with base_offset, log_append_time_ms, and log_start_offset all -1.
+    Valid topics/partitions get error_code 0 with base_offset 0,
+    log_append_time_ms -1, and log_start_offset 0. Invalid topics or
+    partitions get error_code 3 (UNKNOWN_TOPIC_OR_PARTITION) with
+    base_offset, log_append_time_ms, and log_start_offset all -1.
     """
     # Parse the Produce request body to extract topic names and partition indexes.
     # Produce Request (Version: 11) body:
@@ -529,6 +531,7 @@ def build_produce_response(data, correlation_id, body_offset):
     for _ in range(num_topics):
         name, offset = read_compact_string(data, offset)
         num_partitions, offset = read_compact_array_count(data, offset)
+        topic_id = topics.get(name)
         partition_entries = b""
         for _ in range(num_partitions):
             index, offset = struct.unpack(">i", data[offset:offset + 4])[0], offset + 4
@@ -536,13 +539,26 @@ def build_produce_response(data, correlation_id, body_offset):
             rec_len, offset = read_varint(data, offset)
             if rec_len > 0:
                 offset += rec_len - 1
-            # Build the partition response entry with error_code 3.
+            # Validate that the topic and partition both exist.
+            valid = (
+                topic_id is not None
+                and any(p["partition_id"] == index for p in partitions.get(topic_id, []))
+            )
+            if valid:
+                error_code = 0
+                base_offset = 0
+                log_start_offset = 0
+            else:
+                error_code = 3
+                base_offset = -1
+                log_start_offset = -1
+            # Build the partition response entry.
             partition_entries += (
                 struct.pack(">i", index)  # index
-                + struct.pack(">h", 3)  # error_code: 3 (UNKNOWN_TOPIC_OR_PARTITION)
-                + struct.pack(">q", -1)  # base_offset: -1
+                + struct.pack(">h", error_code)  # error_code
+                + struct.pack(">q", base_offset)  # base_offset
                 + struct.pack(">q", -1)  # log_append_time_ms: -1
-                + struct.pack(">q", -1)  # log_start_offset: -1
+                + struct.pack(">q", log_start_offset)  # log_start_offset
                 + bytes([1])  # record_errors: empty array (n + 1 = 1)
                 + bytes([0])  # error_message: null
                 + bytes([0])  # TAG_BUFFER: empty
@@ -577,7 +593,7 @@ def handle_request(data, topics, partitions):
     elif api_key == 1:  # Fetch
         return build_fetch_response(data, correlation_id, body_offset, topics, partitions)
     elif api_key == 0:  # Produce
-        return build_produce_response(data, correlation_id, body_offset)
+        return build_produce_response(data, correlation_id, body_offset, topics, partitions)
     else:  # ApiVersions (18)
         return build_api_versions_response(correlation_id, api_version)
 
