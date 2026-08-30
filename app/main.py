@@ -359,11 +359,38 @@ def build_describe_topic_partitions_response(data, correlation_id, body_offset, 
     return struct.pack(">i", message_size) + header + body
 
 
+def build_fetch_response(correlation_id):
+    """Build a Fetch (v16) response for a request with no topics.
+
+    Fetch Response (Version: 16):
+      throttle_time_ms => INT32
+      error_code => INT16
+      session_id => INT32
+      responses => COMPACT_ARRAY of { topic_id, partitions }
+      [node_endpoints]<tag: 0> (omitted)
+    """
+    # Response header v1: correlation_id (INT32) + TAG_BUFFER (empty)
+    header = struct.pack(">i", correlation_id) + bytes([0])
+
+    body = (
+        struct.pack(">i", 0)  # throttle_time_ms: 0
+        + struct.pack(">h", 0)  # error_code: 0
+        + struct.pack(">i", 0)  # session_id: 0
+        + bytes([1])  # responses array: 0 elements (n + 1 = 1)
+        + bytes([0])  # TAG_BUFFER: empty
+    )
+
+    message_size = len(header) + len(body)
+    return struct.pack(">i", message_size) + header + body
+
+
 def handle_request(data, topics, partitions):
     api_key, api_version, correlation_id, body_offset = parse_request_header(data)
 
     if api_key == 75:  # DescribeTopicPartitions
         return build_describe_topic_partitions_response(data, correlation_id, body_offset, topics, partitions)
+    elif api_key == 1:  # Fetch
+        return build_fetch_response(correlation_id)
     else:  # ApiVersions (18)
         return build_api_versions_response(correlation_id, api_version)
 
