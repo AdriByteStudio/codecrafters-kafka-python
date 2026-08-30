@@ -31,6 +31,17 @@ def write_varint(value):
     return out
 
 
+def write_compact_string(s):
+    """Encode a COMPACT_STRING (varint(len + 1) + bytes)."""
+    b = s.encode("utf-8")
+    return write_varint(len(b) + 1) + b
+
+
+def write_compact_array(count):
+    """Encode a COMPACT_ARRAY length prefix (varint(count + 1))."""
+    return write_varint(count + 1)
+
+
 def read_topic_log_records(topic_name):
     """Read the record batch(es) from a topic's log file on disk.
 
@@ -489,6 +500,75 @@ def build_fetch_response(data, correlation_id, body_offset, topics, partitions):
     return struct.pack(">i", message_size) + header + body
 
 
+def build_produce_response(data, correlation_id, body_offset):
+    """Build a Produce (v11) response for invalid topics or partitions.
+
+    Produce Response (Version: 11):
+      throttle_time_ms => INT32
+      responses => COMPACT_ARRAY of { name, partition_responses }
+      TAG_BUFFER
+
+    Each partition response carries error_code 3 (UNKNOWN_TOPIC_OR_PARTITION)
+    with base_offset, log_append_time_ms, and log_start_offset all -1.
+    """
+    # Parse the Produce request body to extract topic names and partition indexes.
+    # Produce Request (Version: 11) body:
+    #   transactional_id(COMPACT_NULLABLE_STRING) acks(INT16) timeout_ms(INT32)
+    #   [topic_data] (COMPACT_ARRAY of { name(COMPACT_STRING),
+    #     [partition_data] (COMPACT_ARRAY of { index(INT32), records(COMPACT_RECORDS) }),
+    #     TAG_BUFFER })
+    offset = body_offset
+    # transactional_id: COMPACT_NULLABLE_STRING (varint; 0 = null)
+    tid_len, offset = read_varint(data, offset)
+    if tid_len > 0:
+        offset += tid_len - 1
+    offset += 2  # acks
+    offset += 4  # timeout_ms
+    num_topics, offset = read_compact_array_count(data, offset)
+    topic_entries = b""
+    for _ in range(num_topics):
+        name, offset = read_compact_string(data, offset)
+        num_partitions, offset = read_compact_array_count(data, offset)
+        partition_entries = b""
+        for _ in range(num_partitions):
+            index, offset = struct.unpack(">i", data[offset:offset + 4])[0], offset + 4
+            # records: COMPACT_RECORDS (varint length + data)
+            rec_len, offset = read_varint(data, offset)
+            if rec_len > 0:
+                offset += rec_len - 1
+            # Build the partition response entry with error_code 3.
+            partition_entries += (
+                struct.pack(">i", index)  # index
+                + struct.pack(">h", 3)  # error_code: 3 (UNKNOWN_TOPIC_OR_PARTITION)
+                + struct.pack(">q", -1)  # base_offset: -1
+                + struct.pack(">q", -1)  # log_append_time_ms: -1
+                + struct.pack(">q", -1)  # log_start_offset: -1
+                + bytes([1])  # record_errors: empty array (n + 1 = 1)
+                + bytes([0])  # error_message: null
+                + bytes([0])  # TAG_BUFFER: empty
+            )
+        topic_entries += (
+            write_compact_string(name)  # name
+            + write_compact_array(num_partitions)  # partition_responses array
+            + partition_entries
+            + bytes([0])  # TAG_BUFFER: empty
+        )
+        offset = skip_tag_buffer(data, offset)  # topic TAG_BUFFER
+
+    # Response header v1: correlation_id (INT32) + TAG_BUFFER (empty)
+    header = struct.pack(">i", correlation_id) + bytes([0])
+
+    body = (
+        struct.pack(">i", 0)  # throttle_time_ms: 0
+        + write_compact_array(num_topics)  # responses array
+        + topic_entries
+        + bytes([0])  # TAG_BUFFER: empty
+    )
+
+    message_size = len(header) + len(body)
+    return struct.pack(">i", message_size) + header + body
+
+
 def handle_request(data, topics, partitions):
     api_key, api_version, correlation_id, body_offset = parse_request_header(data)
 
@@ -496,6 +576,8 @@ def handle_request(data, topics, partitions):
         return build_describe_topic_partitions_response(data, correlation_id, body_offset, topics, partitions)
     elif api_key == 1:  # Fetch
         return build_fetch_response(data, correlation_id, body_offset, topics, partitions)
+    elif api_key == 0:  # Produce
+        return build_produce_response(data, correlation_id, body_offset)
     else:  # ApiVersions (18)
         return build_api_versions_response(correlation_id, api_version)
 
