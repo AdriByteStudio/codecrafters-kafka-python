@@ -265,12 +265,17 @@ def build_api_versions_response(correlation_id, request_api_version):
         error_code = 35
 
     # Build the api_keys array with entries for:
+    #   - API key 0 (Produce), versions 0-11
     #   - API key 1 (Fetch), versions 0-16
     #   - API key 18 (ApiVersions), versions 0-4
     #   - API key 75 (DescribeTopicPartitions), versions 0-0
-    # COMPACT_ARRAY length is encoded as n + 1 (unsigned varint). With 3 elements, that's 4.
+    # COMPACT_ARRAY length is encoded as n + 1 (unsigned varint). With 4 elements, that's 5.
     api_keys = (
-        bytes([4])  # array length: 3 elements -> 4
+        bytes([5])  # array length: 4 elements -> 5
+        + struct.pack(">h", 0)  # api_key: 0 (Produce)
+        + struct.pack(">h", 0)  # min_version: 0
+        + struct.pack(">h", 11)  # max_version: 11
+        + bytes([0])  # TAG_BUFFER: empty
         + struct.pack(">h", 1)  # api_key: 1 (Fetch)
         + struct.pack(">h", 0)  # min_version: 0
         + struct.pack(">h", 16)  # max_version: 16
