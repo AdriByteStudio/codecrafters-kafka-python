@@ -170,7 +170,8 @@ def load_cluster_metadata(log_path):
         offset += 4
 
         for _ in range(records_count):
-            rec_len, offset = read_varint(data, offset)
+            # Record length is ZigZag-encoded (writeVarint uses encodeZigzag32)
+            rec_len, offset = read_zigzag_varint(data, offset)
             rec_end = offset + rec_len
             offset += 1  # attributes
             _, offset = read_zigzag_varint(data, offset)  # timestampDelta
@@ -187,12 +188,12 @@ def load_cluster_metadata(log_path):
                     topics[parsed["name"]] = parsed["topic_id"]
                 elif parsed is not None and "partition_id" in parsed:
                     partitions.setdefault(parsed["topic_id"], []).append(parsed)
-            # skip headers
-            hcount, offset = read_varint(data, offset)
+            # Headers: also ZigZag-encoded in DefaultRecord
+            hcount, offset = read_zigzag_varint(data, offset)
             for _ in range(hcount):
-                hk_len, offset = read_varint(data, offset)
+                hk_len, offset = read_zigzag_varint(data, offset)
                 offset += hk_len
-                hv_len, offset = read_varint(data, offset)
+                hv_len, offset = read_zigzag_varint(data, offset)
                 offset += hv_len
             offset = rec_end
         offset = batch_end
