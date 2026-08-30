@@ -359,7 +359,7 @@ def build_describe_topic_partitions_response(data, correlation_id, body_offset, 
     return struct.pack(">i", message_size) + header + body
 
 
-def build_fetch_response(data, correlation_id, body_offset):
+def build_fetch_response(data, correlation_id, body_offset, topics, partitions):
     """Build a Fetch (v16) response.
 
     Fetch Response (Version: 16):
@@ -370,7 +370,9 @@ def build_fetch_response(data, correlation_id, body_offset):
       [node_endpoints]<tag: 0> (omitted)
 
     Each requested topic gets a response entry. For an unknown topic, the
-    partition entry carries error_code 100 (UNKNOWN_TOPIC_ID).
+    partition entry carries error_code 100 (UNKNOWN_TOPIC_ID). For a known
+    topic with no messages, the partition entry carries error_code 0 and an
+    empty records batch.
     """
     # Parse the Fetch request body to extract the requested topic IDs.
     # Fetch Request (Version: 16) body:
@@ -404,17 +406,25 @@ def build_fetch_response(data, correlation_id, body_offset):
     header = struct.pack(">i", correlation_id) + bytes([0])
 
     # Build each topic entry. For an unknown topic, return error_code 100.
+    # For a known topic with no messages, return error_code 0 and an empty
+    # records batch.
     topic_entries = b""
     for topic_id in topic_ids:
+        if topic_id in partitions:
+            error_code = 0  # No Error
+            records = bytes([1])  # empty records batch (0 bytes of data)
+        else:
+            error_code = 100  # UNKNOWN_TOPIC_ID
+            records = bytes([0])  # null records
         partition = (
             struct.pack(">i", 0)  # partition_index: 0
-            + struct.pack(">h", 100)  # error_code: 100 (UNKNOWN_TOPIC_ID)
+            + struct.pack(">h", error_code)  # error_code
             + struct.pack(">q", -1)  # high_watermark: -1
             + struct.pack(">q", -1)  # last_stable_offset: -1
             + struct.pack(">q", -1)  # log_start_offset: -1
             + bytes([1])  # aborted_transactions: empty array (n + 1 = 1)
             + struct.pack(">i", -1)  # preferred_read_replica: -1
-            + bytes([0])  # records: null (COMPACT_RECORDS)
+            + records  # records (COMPACT_RECORDS)
             + bytes([0])  # TAG_BUFFER: empty
         )
         topic_entries += (
@@ -443,7 +453,7 @@ def handle_request(data, topics, partitions):
     if api_key == 75:  # DescribeTopicPartitions
         return build_describe_topic_partitions_response(data, correlation_id, body_offset, topics, partitions)
     elif api_key == 1:  # Fetch
-        return build_fetch_response(data, correlation_id, body_offset)
+        return build_fetch_response(data, correlation_id, body_offset, topics, partitions)
     else:  # ApiVersions (18)
         return build_api_versions_response(correlation_id, api_version)
 
