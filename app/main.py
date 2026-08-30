@@ -2,59 +2,65 @@ import socket
 import struct
 
 
+def handle_request(data):
+    # Parse request header v2:
+    #   message_size:         INT32 (4 bytes)
+    #   request_api_key:      INT16 (2 bytes)
+    #   request_api_version:  INT16 (2 bytes)
+    #   correlation_id:       INT32 (4 bytes)
+    #   client_id:            NULLABLE_STRING (variable)
+    #   TAG_BUFFER:           TAGGED_FIELDS (variable)
+    request_api_version = struct.unpack(">h", data[6:8])[0]
+    correlation_id = struct.unpack(">i", data[8:12])[0]
+
+    # ApiVersions response body (v4):
+    #   error_code:        INT16
+    #   api_keys:          COMPACT_ARRAY of { api_key, min_version, max_version, TAG_BUFFER }
+    #   throttle_time_ms:  INT32
+    #   TAG_BUFFER:        TAGGED_FIELDS
+    #
+    # error_code 35 = UNSUPPORTED_VERSION when the requested version is not supported.
+    # We support ApiVersions versions 0-4.
+    if 0 <= request_api_version <= 4:
+        error_code = 0
+    else:
+        error_code = 35
+
+    # Build the api_keys array with one entry for API key 18 (ApiVersions), versions 0-4.
+    # COMPACT_ARRAY length is encoded as n + 1 (unsigned varint). With 1 element, that's 2.
+    api_keys = (
+        bytes([2])  # array length: 1 element -> 2
+        + struct.pack(">h", 18)  # api_key: 18 (ApiVersions)
+        + struct.pack(">h", 0)  # min_version: 0
+        + struct.pack(">h", 4)  # max_version: 4
+        + bytes([0])  # TAG_BUFFER: empty
+    )
+
+    # Build the response body
+    body = (
+        struct.pack(">h", error_code)  # error_code
+        + api_keys  # api_keys array
+        + struct.pack(">i", 0)  # throttle_time_ms: 0
+        + bytes([0])  # TAG_BUFFER: empty
+    )
+
+    # Build the full response: message_size + header (correlation_id) + body
+    header = struct.pack(">i", correlation_id)
+    message_size = len(header) + len(body)
+    return struct.pack(">i", message_size) + header + body
+
+
 def main():
     server = socket.create_server(("localhost", 9092), reuse_port=True)
     conn, addr = server.accept()
     with conn:
-        # Read the incoming request
-        data = conn.recv(1024)
-
-        # Parse request header v2:
-        #   message_size:         INT32 (4 bytes)
-        #   request_api_key:      INT16 (2 bytes)
-        #   request_api_version:  INT16 (2 bytes)
-        #   correlation_id:       INT32 (4 bytes)
-        #   client_id:            NULLABLE_STRING (variable)
-        #   TAG_BUFFER:           TAGGED_FIELDS (variable)
-        request_api_version = struct.unpack(">h", data[6:8])[0]
-        correlation_id = struct.unpack(">i", data[8:12])[0]
-
-        # ApiVersions response body (v4):
-        #   error_code:        INT16
-        #   api_keys:          COMPACT_ARRAY of { api_key, min_version, max_version, TAG_BUFFER }
-        #   throttle_time_ms:  INT32
-        #   TAG_BUFFER:        TAGGED_FIELDS
-        #
-        # error_code 35 = UNSUPPORTED_VERSION when the requested version is not supported.
-        # We support ApiVersions versions 0-4.
-        if 0 <= request_api_version <= 4:
-            error_code = 0
-        else:
-            error_code = 35
-
-        # Build the api_keys array with one entry for API key 18 (ApiVersions), versions 0-4.
-        # COMPACT_ARRAY length is encoded as n + 1 (unsigned varint). With 1 element, that's 2.
-        api_keys = (
-            bytes([2])  # array length: 1 element -> 2
-            + struct.pack(">h", 18)  # api_key: 18 (ApiVersions)
-            + struct.pack(">h", 0)  # min_version: 0
-            + struct.pack(">h", 4)  # max_version: 4
-            + bytes([0])  # TAG_BUFFER: empty
-        )
-
-        # Build the response body
-        body = (
-            struct.pack(">h", error_code)  # error_code
-            + api_keys  # api_keys array
-            + struct.pack(">i", 0)  # throttle_time_ms: 0
-            + bytes([0])  # TAG_BUFFER: empty
-        )
-
-        # Build the full response: message_size + header (correlation_id) + body
-        header = struct.pack(">i", correlation_id)
-        message_size = len(header) + len(body)
-        response = struct.pack(">i", message_size) + header + body
-        conn.sendall(response)
+        # Handle multiple sequential requests on the same connection.
+        while True:
+            data = conn.recv(1024)
+            if not data:
+                break  # client closed the connection
+            response = handle_request(data)
+            conn.sendall(response)
 
 
 if __name__ == "__main__":
