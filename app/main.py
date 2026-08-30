@@ -359,8 +359,8 @@ def build_describe_topic_partitions_response(data, correlation_id, body_offset, 
     return struct.pack(">i", message_size) + header + body
 
 
-def build_fetch_response(correlation_id):
-    """Build a Fetch (v16) response for a request with no topics.
+def build_fetch_response(data, correlation_id, body_offset):
+    """Build a Fetch (v16) response.
 
     Fetch Response (Version: 16):
       throttle_time_ms => INT32
@@ -368,16 +368,68 @@ def build_fetch_response(correlation_id):
       session_id => INT32
       responses => COMPACT_ARRAY of { topic_id, partitions }
       [node_endpoints]<tag: 0> (omitted)
+
+    Each requested topic gets a response entry. For an unknown topic, the
+    partition entry carries error_code 100 (UNKNOWN_TOPIC_ID).
     """
+    # Parse the Fetch request body to extract the requested topic IDs.
+    # Fetch Request (Version: 16) body:
+    #   max_wait_ms(INT32) min_bytes(INT32) max_bytes(INT32) isolation_level(INT8)
+    #   session_id(INT32) session_epoch(INT32)
+    #   [topics] (COMPACT_ARRAY of { topic_id(UUID), [partitions], TAG_BUFFER })
+    offset = body_offset
+    offset += 4  # max_wait_ms
+    offset += 4  # min_bytes
+    offset += 4  # max_bytes
+    offset += 1  # isolation_level
+    offset += 4  # session_id
+    offset += 4  # session_epoch
+    num_topics, offset = read_compact_array_count(data, offset)
+    topic_ids = []
+    for _ in range(num_topics):
+        topic_id, offset = read_uuid(data, offset)
+        topic_ids.append(topic_id)
+        num_partitions, offset = read_compact_array_count(data, offset)
+        for _ in range(num_partitions):
+            offset += 4  # partition
+            offset += 4  # current_leader_epoch
+            offset += 8  # fetch_offset
+            offset += 4  # last_fetched_epoch
+            offset += 8  # log_start_offset
+            offset += 4  # partition_max_bytes
+            offset = skip_tag_buffer(data, offset)  # partition TAG_BUFFER
+        offset = skip_tag_buffer(data, offset)  # topic TAG_BUFFER
+
     # Response header v1: correlation_id (INT32) + TAG_BUFFER (empty)
     header = struct.pack(">i", correlation_id) + bytes([0])
+
+    # Build each topic entry. For an unknown topic, return error_code 100.
+    topic_entries = b""
+    for topic_id in topic_ids:
+        partition = (
+            struct.pack(">i", 0)  # partition_index: 0
+            + struct.pack(">h", 100)  # error_code: 100 (UNKNOWN_TOPIC_ID)
+            + struct.pack(">q", -1)  # high_watermark: -1
+            + struct.pack(">q", -1)  # last_stable_offset: -1
+            + struct.pack(">q", -1)  # log_start_offset: -1
+            + bytes([1])  # aborted_transactions: empty array (n + 1 = 1)
+            + struct.pack(">i", -1)  # preferred_read_replica: -1
+            + bytes([0])  # records: null (COMPACT_RECORDS)
+            + bytes([0])  # TAG_BUFFER: empty
+        )
+        topic_entries += (
+            topic_id  # topic_id: UUID
+            + bytes([2])  # partitions array: 1 element (n + 1 = 2)
+            + partition
+        )
 
     body = (
         struct.pack(">i", 0)  # throttle_time_ms: 0
         + struct.pack(">h", 0)  # error_code: 0
         + struct.pack(">i", 0)  # session_id: 0
-        + bytes([1])  # responses array: 0 elements (n + 1 = 1)
-        + bytes([0])  # TAG_BUFFER: empty
+        + bytes([len(topic_ids) + 1])  # responses array: N elements (n + 1)
+        + topic_entries
+        + bytes([0])  # TAG_BUFFER: empty (no node_endpoints)
     )
 
     message_size = len(header) + len(body)
@@ -390,7 +442,7 @@ def handle_request(data, topics, partitions):
     if api_key == 75:  # DescribeTopicPartitions
         return build_describe_topic_partitions_response(data, correlation_id, body_offset, topics, partitions)
     elif api_key == 1:  # Fetch
-        return build_fetch_response(correlation_id)
+        return build_fetch_response(data, correlation_id, body_offset)
     else:  # ApiVersions (18)
         return build_api_versions_response(correlation_id, api_version)
 
